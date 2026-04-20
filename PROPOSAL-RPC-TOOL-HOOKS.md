@@ -157,7 +157,7 @@ setExternalToolHooks(hooks: ExternalToolHooks): void {
 ```typescript
 private _installAgentToolHooks(): void {
   this.agent.beforeToolCall = async ({ toolCall, args }) => {
-    // 1. Extension runner hooks (existing, unchanged)
+    // 1. Extension runner hooks
     const runner = this._extensionRunner;
     let extensionResult: BeforeToolCallResult | undefined;
     if (runner?.hasHandlers("tool_call")) {
@@ -190,7 +190,7 @@ private _installAgentToolHooks(): void {
   };
 
   this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
-    // 1. Extension runner hooks (existing, unchanged)
+    // 1. Extension runner hooks -- may override on error (see #3051)
     const runner = this._extensionRunner;
     let currentResult = result;
     let currentIsError = isError;
@@ -202,11 +202,11 @@ private _installAgentToolHooks(): void {
         toolCallId: toolCall.id,
         input: args as Record<string, unknown>,
         content: result.content,
-        details: isError ? undefined : result.details,
+        details: result.details,
         isError,
       });
 
-      if (hookResult && !isError) {
+      if (hookResult) {
         if (hookResult.content) currentResult = { ...currentResult, content: hookResult.content };
         if (hookResult.details !== undefined) currentResult = { ...currentResult, details: hookResult.details };
         if (hookResult.isError !== undefined) currentIsError = hookResult.isError;

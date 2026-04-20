@@ -4,7 +4,7 @@
 
 Allow RPC clients to register tools whose execution logic lives in the client process. When the LLM calls such a tool, the server sends an execution request over the RPC protocol, the client runs the logic, and sends back the result. The tool is a first-class participant in the server's tool machinery: system prompt injection, hooks, agent events, shadowing of builtins by name.
 
-This proposal assumes the RPC tool event hooks proposal is already implemented. Client tools participate in the hook system like any other tool.
+This proposal is paired with `PROPOSAL-RPC-TOOL-HOOKS.md` and assumes that design is shipped together. Client tools participate in the hook system like any other tool.
 
 ## How It Plugs In
 
@@ -67,6 +67,7 @@ Steps 2-3 happen inside `beforeToolCall`. Steps 7-8 happen inside `afterToolCall
       parameters: JSONSchema;
       promptSnippet?: string;
       promptGuidelines?: string[];
+      executionMode?: "sequential" | "parallel";
     };
   }
 
@@ -126,6 +127,8 @@ const tbSchema = Type.Unsafe(registration.parameters);
 
 TypeBox's `Value.Check()` works against any valid JSON Schema, so validation is identical.
 
+Validation happens in the agent core (`wrapToolDefinition`) before the client tool's `execute` is invoked, so the client only ever sees schema-valid args. If a client tool needs to accept loose input, declare a permissive schema (e.g. `Type.Record(Type.String(), Type.Unknown())`).
+
 ## Server-Side Implementation (rpc-mode.ts)
 
 ### State
@@ -154,8 +157,11 @@ function createRpcBridgeTool(
     parameters: Type.Unsafe(reg.parameters),
     promptSnippet: reg.promptSnippet,
     promptGuidelines: reg.promptGuidelines,
+    executionMode: reg.executionMode,
 
-    execute(toolCallId, params, signal, onUpdate) {
+    // `_ctx` is the ExtensionContext passed by the wrapper; client tools don't
+    // receive server state directly. If needed, clients query via get_state, etc.
+    execute(toolCallId, params, signal, onUpdate, _ctx) {
       const requestId = crypto.randomUUID();
 
       return new Promise((resolve, reject) => {
@@ -294,14 +300,14 @@ Internally, `onToolExecute` hooks into `handleLine`:
 
 ## What Doesn't Cross the Boundary
 
-- **`renderCall` / `renderResult`**: Requires TUI `Component` factories. Client tools get default rendering (args JSON + result text). The client interprets `tool_execution_*` events for its own rendering.
+- **`renderCall` / `renderResult` / `renderShell`**: Require TUI `Component` factories or server-side rendering knobs. Client tools always use the default shell and default call/result rendering. The RPC client interprets `tool_execution_*` events for its own UI.
 - **`details`**: Always `undefined` for client tools. The `details` field is for server-side rendering; the client can embed structured data in `content` text if needed.
-- **`prepareArguments`**: Not exposed. JSON Schema validation handles type coercion. If a tool needs arg preparation, the client can do it in its `onToolExecute` handler before returning.
-- **`ExtensionContext` in `execute()`**: Server-side tool `execute` receives a context object. Client tools don't -- they have their own client-side state. If a client tool needs server state (e.g., model info, cwd), it can query via existing RPC commands (`get_state`).
+- **`prepareArguments`**: Not exposed. `wrapToolDefinition` runs TypeBox validation before the bridge tool executes, so the client never sees raw unvalidated args. Clients needing loose typing should declare a permissive parameter schema.
+- **`ExtensionContext` in `execute()`**: Server-side tool `execute` receives a context object as its 5th arg. The bridge tool accepts and ignores it -- client tools have their own client-side state. If a client tool needs server state (e.g., model info, cwd), it can query via existing RPC commands (`get_state`).
 
 ## Cancellation
 
-No timeout on `tool_execute_request`. The client has full control over execution duration. The only automatic resolution is agent abort:
-- Agent abort fires the `signal` abort listener in the bridge tool
-- Bridge tool sends `tool_execute_cancel` to the client and rejects with an error
-- Agent loop catches the rejection and produces an `isError: true` tool result
+No timeout on `tool_execute_request`. The client has full control over execution duration. Automatic resolutions:
+
+- **Agent abort**: fires the `signal` abort listener in the bridge tool, which sends `tool_execute_cancel` to the client and rejects the `execute()` promise. The agent loop catches the rejection and produces an `isError: true` tool result.
+- **Client disconnect / stdin EOF**: `rpc-mode` must reject every entry in `pendingToolExecutions` with a disconnect error when stdin closes or the process detects the client has gone away. Otherwise the agent loop hangs forever waiting for `tool_execute_response` that will never arrive. The reject produces an `isError: true` tool result and the turn completes normally.
