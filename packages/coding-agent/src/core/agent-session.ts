@@ -21,6 +21,7 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	BeforeToolCallResult,
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
@@ -217,6 +218,26 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+/**
+ * External tool hooks for pre/post tool execution interception.
+ * Used by RPC mode to expose tool_call/tool_result hooks over the protocol.
+ */
+export interface ExternalToolHooks {
+	onToolCall?: (event: {
+		toolCallId: string;
+		toolName: string;
+		args: Record<string, unknown>;
+	}) => Promise<{ block?: boolean; reason?: string } | undefined>;
+
+	onToolResult?: (event: {
+		toolCallId: string;
+		toolName: string;
+		args: Record<string, unknown>;
+		content: (TextContent | ImageContent)[];
+		isError: boolean;
+	}) => Promise<{ content?: (TextContent | ImageContent)[]; isError?: boolean } | undefined>;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -288,6 +309,9 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
+
+	// External tool hooks (for RPC mode)
+	private _externalToolHooks: ExternalToolHooks = {};
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -364,54 +388,99 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			// 1. Extension runner hooks
 			const runner = this._extensionRunner;
-			if (!runner?.hasHandlers("tool_call")) {
-				return undefined;
-			}
+			let extensionResult: BeforeToolCallResult | undefined;
+			if (runner?.hasHandlers("tool_call")) {
+				await this._agentEventQueue;
 
-			await this._agentEventQueue;
-
-			try {
-				return await runner.emitToolCall({
-					type: "tool_call",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					input: args as Record<string, unknown>,
-				});
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
+				try {
+					extensionResult = await runner.emitToolCall({
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						input: args as Record<string, unknown>,
+					});
+					if (extensionResult?.block) return extensionResult;
+				} catch (err) {
+					if (err instanceof Error) {
+						throw err;
+					}
+					throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
+
+			// 2. External hooks (RPC)
+			if (this._externalToolHooks.onToolCall) {
+				const externalResult = await this._externalToolHooks.onToolCall({
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: args as Record<string, unknown>,
+				});
+				if (externalResult?.block) return externalResult;
+			}
+
+			return extensionResult;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			// 1. Extension runner hooks
 			const runner = this._extensionRunner;
-			if (!runner?.hasHandlers("tool_result")) {
-				return undefined;
+			let currentResult = result;
+			let currentIsError = isError;
+
+			if (runner?.hasHandlers("tool_result")) {
+				const hookResult = await runner.emitToolResult({
+					type: "tool_result",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+					content: result.content,
+					details: result.details,
+					isError,
+				});
+
+				if (hookResult) {
+					if (hookResult.content) currentResult = { ...currentResult, content: hookResult.content };
+					if (hookResult.details !== undefined) currentResult = { ...currentResult, details: hookResult.details };
+					if (hookResult.isError !== undefined) currentIsError = hookResult.isError;
+				}
 			}
 
-			const hookResult = await runner.emitToolResult({
-				type: "tool_result",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
-			});
+			// 2. External hooks (RPC) -- sees post-extension content/isError
+			if (this._externalToolHooks.onToolResult) {
+				const externalResult = await this._externalToolHooks.onToolResult({
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: args as Record<string, unknown>,
+					content: currentResult.content,
+					isError: currentIsError,
+				});
 
-			if (!hookResult) {
-				return undefined;
+				if (externalResult) {
+					return {
+						content: externalResult.content ?? currentResult.content,
+						details: currentResult.details,
+						isError: externalResult.isError ?? currentIsError,
+					};
+				}
 			}
 
-			return {
-				content: hookResult.content,
-				details: hookResult.details,
-				isError: hookResult.isError ?? isError,
-			};
+			// Return extension modifications if any were made
+			if (currentResult !== result || currentIsError !== isError) {
+				return { content: currentResult.content, details: currentResult.details, isError: currentIsError };
+			}
+			return undefined;
 		};
+	}
+
+	/**
+	 * Set external tool hooks for pre/post tool execution interception.
+	 * Used by RPC mode to expose tool_call/tool_result hooks over the protocol.
+	 * Pass an empty object to clear hooks.
+	 */
+	setExternalToolHooks(hooks: ExternalToolHooks): void {
+		this._externalToolHooks = hooks;
 	}
 
 	// =========================================================================

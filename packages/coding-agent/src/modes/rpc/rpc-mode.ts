@@ -29,6 +29,10 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
+	RpcToolCallHookRequest,
+	RpcToolCallHookResponse,
+	RpcToolResultHookRequest,
+	RpcToolResultHookResponse,
 } from "./rpc-types.js";
 
 // Re-export types for consumers
@@ -38,6 +42,11 @@ export type {
 	RpcExtensionUIResponse,
 	RpcResponse,
 	RpcSessionState,
+	RpcToolCallHookRequest,
+	RpcToolCallHookResponse,
+	RpcToolHookRequest,
+	RpcToolResultHookRequest,
+	RpcToolResultHookResponse,
 } from "./rpc-types.js";
 
 /**
@@ -78,6 +87,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let shutdownRequested = false;
 	let shuttingDown = false;
 	const signalCleanupHandlers: Array<() => void> = [];
+
+	// Tool hook state
+	let toolHookSubscription: {
+		toolCall: boolean;
+		toolResult: boolean;
+		toolNames: Set<string> | null; // null = all tools
+	} | null = null;
+
+	const pendingToolHooks = new Map<string, { resolve: (result: unknown) => void }>();
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -285,6 +303,101 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		},
 	});
 
+	/**
+	 * Install external tool hooks on the session based on current subscription.
+	 * Called when subscription changes or session is rebound.
+	 */
+	const installRpcToolHooks = (): void => {
+		if (!toolHookSubscription) {
+			session.setExternalToolHooks({});
+			return;
+		}
+
+		session.setExternalToolHooks({
+			onToolCall: async (event) => {
+				if (!toolHookSubscription?.toolCall) return undefined;
+				if (toolHookSubscription.toolNames && !toolHookSubscription.toolNames.has(event.toolName)) {
+					return undefined;
+				}
+
+				const hookId = crypto.randomUUID();
+				return new Promise((resolve) => {
+					const signal = session.agent.signal;
+					const onAbort = () => {
+						pendingToolHooks.delete(hookId);
+						resolve(undefined);
+					};
+					signal?.addEventListener("abort", onAbort, { once: true });
+
+					pendingToolHooks.set(hookId, {
+						resolve: (raw: unknown) => {
+							signal?.removeEventListener("abort", onAbort);
+							pendingToolHooks.delete(hookId);
+							const response = raw as RpcToolCallHookResponse | undefined;
+							if (!response || (!response.block && !response.args)) {
+								resolve(undefined);
+								return;
+							}
+							if (response.args) {
+								for (const key of Object.keys(event.args)) delete event.args[key];
+								Object.assign(event.args, response.args);
+							}
+							resolve(response.block ? { block: true, reason: response.reason } : undefined);
+						},
+					});
+
+					output({
+						type: "tool_call_hook_request",
+						id: hookId,
+						toolCallId: event.toolCallId,
+						toolName: event.toolName,
+						args: event.args,
+					} satisfies RpcToolCallHookRequest);
+				});
+			},
+
+			onToolResult: async (event) => {
+				if (!toolHookSubscription?.toolResult) return undefined;
+				if (toolHookSubscription.toolNames && !toolHookSubscription.toolNames.has(event.toolName)) {
+					return undefined;
+				}
+
+				const hookId = crypto.randomUUID();
+				return new Promise((resolve) => {
+					const signal = session.agent.signal;
+					const onAbort = () => {
+						pendingToolHooks.delete(hookId);
+						resolve(undefined);
+					};
+					signal?.addEventListener("abort", onAbort, { once: true });
+
+					pendingToolHooks.set(hookId, {
+						resolve: (raw: unknown) => {
+							signal?.removeEventListener("abort", onAbort);
+							pendingToolHooks.delete(hookId);
+							const response = raw as RpcToolResultHookResponse | undefined;
+							if (!response || (response.content === undefined && response.isError === undefined)) {
+								resolve(undefined);
+								return;
+							}
+							resolve({ content: response.content, isError: response.isError });
+						},
+					});
+
+					output({
+						type: "tool_result_hook_request",
+						id: hookId,
+						toolCallId: event.toolCallId,
+						toolName: event.toolName,
+						args: event.args,
+						content: event.content,
+						isError: event.isError,
+					} satisfies RpcToolResultHookRequest);
+				});
+			},
+		});
+	};
+
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
 		await session.bindExtensions({
@@ -337,6 +450,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribe = session.subscribe((event) => {
 			output(event);
 		});
+
+		// Re-install tool hooks on the new session if subscription is active
+		if (toolHookSubscription) {
+			installRpcToolHooks();
+		}
 	};
 
 	const registerSignalHandlers = (): void => {
@@ -631,6 +749,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "get_commands", { commands });
 			}
 
+			// =================================================================
+			// Tool Hooks
+			// =================================================================
+
+			case "subscribe_tool_hooks": {
+				toolHookSubscription = {
+					toolCall: command.hooks.tool_call ?? false,
+					toolResult: command.hooks.tool_result ?? false,
+					toolNames: command.toolNames ? new Set(command.toolNames) : null,
+				};
+				installRpcToolHooks();
+				return success(id, "subscribe_tool_hooks");
+			}
+
+			case "unsubscribe_tool_hooks": {
+				toolHookSubscription = null;
+				session.setExternalToolHooks({});
+				return success(id, "unsubscribe_tool_hooks");
+			}
+
 			default: {
 				const unknownCommand = command as { type: string };
 				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
@@ -690,6 +828,21 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			const pending = pendingExtensionRequests.get(response.id);
 			if (pending) {
 				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
+			}
+			return;
+		}
+
+		// Handle tool hook responses
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"type" in parsed &&
+			(parsed.type === "tool_call_hook_response" || parsed.type === "tool_result_hook_response")
+		) {
+			const response = parsed as RpcToolCallHookResponse | RpcToolResultHookResponse;
+			const pending = pendingToolHooks.get(response.id);
+			if (pending) {
 				pending.resolve(response);
 			}
 			return;

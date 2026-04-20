@@ -6,12 +6,19 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ImageContent } from "@mariozechner/pi-ai";
+import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type {
+	RpcCommand,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+	RpcToolCallHookRequest,
+	RpcToolResultHookRequest,
+} from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -47,6 +54,22 @@ export interface ModelInfo {
 
 export type RpcEventListener = (event: AgentEvent) => void;
 
+/** Handler for tool_call hook requests (pre-execution interception) */
+export type ToolCallHookHandler = (request: {
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+}) => Promise<{ block?: boolean; reason?: string; args?: Record<string, unknown> } | undefined>;
+
+/** Handler for tool_result hook requests (post-execution interception) */
+export type ToolResultHookHandler = (request: {
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+	content: (TextContent | ImageContent)[];
+	isError: boolean;
+}) => Promise<{ content?: (TextContent | ImageContent)[]; isError?: boolean } | undefined>;
+
 // ============================================================================
 // RPC Client
 // ============================================================================
@@ -59,6 +82,8 @@ export class RpcClient {
 		new Map();
 	private requestId = 0;
 	private stderr = "";
+	private toolCallHookHandler: ToolCallHookHandler | null = null;
+	private toolResultHookHandler: ToolResultHookHandler | null = null;
 
 	constructor(private options: RpcClientOptions = {}) {}
 
@@ -382,6 +407,75 @@ export class RpcClient {
 	}
 
 	// =========================================================================
+	// Tool Hooks
+	// =========================================================================
+
+	/**
+	 * Subscribe to tool hooks for pre/post execution interception.
+	 * Replaces any previous subscription.
+	 *
+	 * @param options.toolCall - Subscribe to tool_call hooks (block or rewrite args before execution)
+	 * @param options.toolResult - Subscribe to tool_result hooks (modify result after execution)
+	 * @param options.toolNames - Filter to specific tool names; omit for all tools
+	 */
+	async subscribeToolHooks(options: {
+		toolCall?: boolean;
+		toolResult?: boolean;
+		toolNames?: string[];
+	}): Promise<void> {
+		await this.send({
+			type: "subscribe_tool_hooks",
+			hooks: { tool_call: options.toolCall, tool_result: options.toolResult },
+			toolNames: options.toolNames,
+		});
+	}
+
+	/**
+	 * Unsubscribe from all tool hooks.
+	 */
+	async unsubscribeToolHooks(): Promise<void> {
+		await this.send({ type: "unsubscribe_tool_hooks" });
+	}
+
+	/**
+	 * Set handler for tool_call hook requests (pre-execution interception).
+	 *
+	 * The handler is called before each tool executes (after server-side extension hooks).
+	 * Return `{ block: true, reason }` to prevent execution.
+	 * Return `{ args }` to replace the tool arguments.
+	 * Return `undefined` or `{}` for no modification.
+	 *
+	 * Only one handler at a time. Returns an unsubscribe function.
+	 */
+	onToolCallHook(handler: ToolCallHookHandler): () => void {
+		this.toolCallHookHandler = handler;
+		return () => {
+			if (this.toolCallHookHandler === handler) {
+				this.toolCallHookHandler = null;
+			}
+		};
+	}
+
+	/**
+	 * Set handler for tool_result hook requests (post-execution interception).
+	 *
+	 * The handler is called after each tool executes (after server-side extension hooks).
+	 * Return `{ content }` to replace the tool result content.
+	 * Return `{ isError }` to change the error flag.
+	 * Return `undefined` or `{}` for no modification.
+	 *
+	 * Only one handler at a time. Returns an unsubscribe function.
+	 */
+	onToolResultHook(handler: ToolResultHookHandler): () => void {
+		this.toolResultHookHandler = handler;
+		return () => {
+			if (this.toolResultHookHandler === handler) {
+				this.toolResultHookHandler = null;
+			}
+		};
+	}
+
+	// =========================================================================
 	// Helpers
 	// =========================================================================
 
@@ -453,6 +547,16 @@ export class RpcClient {
 				return;
 			}
 
+			// Handle tool hook requests
+			if (data.type === "tool_call_hook_request") {
+				this.handleToolCallHookRequest(data as RpcToolCallHookRequest);
+				return;
+			}
+			if (data.type === "tool_result_hook_request") {
+				this.handleToolResultHookRequest(data as RpcToolResultHookRequest);
+				return;
+			}
+
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
 				listener(data as AgentEvent);
@@ -460,6 +564,62 @@ export class RpcClient {
 		} catch {
 			// Ignore non-JSON lines
 		}
+	}
+
+	private handleToolCallHookRequest(request: RpcToolCallHookRequest): void {
+		const handler = this.toolCallHookHandler;
+		if (!handler) {
+			// No handler registered, respond with no-op
+			this.process?.stdin?.write(serializeJsonLine({ type: "tool_call_hook_response", id: request.id }));
+			return;
+		}
+
+		handler({
+			toolCallId: request.toolCallId,
+			toolName: request.toolName,
+			args: request.args,
+		})
+			.then((result) => {
+				this.process?.stdin?.write(
+					serializeJsonLine({
+						type: "tool_call_hook_response",
+						id: request.id,
+						...result,
+					}),
+				);
+			})
+			.catch(() => {
+				// On handler error, respond with no-op to avoid blocking
+				this.process?.stdin?.write(serializeJsonLine({ type: "tool_call_hook_response", id: request.id }));
+			});
+	}
+
+	private handleToolResultHookRequest(request: RpcToolResultHookRequest): void {
+		const handler = this.toolResultHookHandler;
+		if (!handler) {
+			this.process?.stdin?.write(serializeJsonLine({ type: "tool_result_hook_response", id: request.id }));
+			return;
+		}
+
+		handler({
+			toolCallId: request.toolCallId,
+			toolName: request.toolName,
+			args: request.args,
+			content: request.content,
+			isError: request.isError,
+		})
+			.then((result) => {
+				this.process?.stdin?.write(
+					serializeJsonLine({
+						type: "tool_result_hook_response",
+						id: request.id,
+						...result,
+					}),
+				);
+			})
+			.catch(() => {
+				this.process?.stdin?.write(serializeJsonLine({ type: "tool_result_hook_response", id: request.id }));
+			});
 	}
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {

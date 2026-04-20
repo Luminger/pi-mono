@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- RPC tool hooks: `subscribe_tool_hooks` and `unsubscribe_tool_hooks` commands expose `tool_call` (pre-execution) and `tool_result` (post-execution) hooks over the RPC protocol. RPC clients can now block tool calls, rewrite arguments, and modify results with the same capabilities as server-side extensions.
+
 ## [0.67.68] - 2026-04-17
 
 ## [0.67.67] - 2026-04-17

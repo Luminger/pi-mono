@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ImageContent, Model } from "@mariozechner/pi-ai";
+import type { ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -65,7 +65,16 @@ export type RpcCommand =
 	| { id?: string; type: "get_messages" }
 
 	// Commands (available for invocation via prompt)
-	| { id?: string; type: "get_commands" };
+	| { id?: string; type: "get_commands" }
+
+	// Tool hooks
+	| {
+			id?: string;
+			type: "subscribe_tool_hooks";
+			hooks: { tool_call?: boolean; tool_result?: boolean };
+			toolNames?: string[];
+	  }
+	| { id?: string; type: "unsubscribe_tool_hooks" };
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)
@@ -200,6 +209,10 @@ export type RpcResponse =
 			data: { commands: RpcSlashCommand[] };
 	  }
 
+	// Tool hooks
+	| { id?: string; type: "response"; command: "subscribe_tool_hooks"; success: true }
+	| { id?: string; type: "response"; command: "unsubscribe_tool_hooks"; success: true }
+
 	// Error response (any command can fail)
 	| { id?: string; type: "response"; command: string; success: false; error: string };
 
@@ -254,6 +267,55 @@ export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true };
+
+// ============================================================================
+// Tool Hook Events (stdout)
+// ============================================================================
+
+/** Emitted before a tool executes, asking the client to evaluate the call */
+export interface RpcToolCallHookRequest {
+	type: "tool_call_hook_request";
+	id: string;
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+}
+
+/** Emitted after a tool executes, asking the client to evaluate the result */
+export interface RpcToolResultHookRequest {
+	type: "tool_result_hook_request";
+	id: string;
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+	content: (TextContent | ImageContent)[];
+	isError: boolean;
+}
+
+export type RpcToolHookRequest = RpcToolCallHookRequest | RpcToolResultHookRequest;
+
+// ============================================================================
+// Tool Hook Commands (stdin)
+// ============================================================================
+
+/** Response to a tool_call_hook_request */
+export interface RpcToolCallHookResponse {
+	type: "tool_call_hook_response";
+	id: string;
+	block?: boolean;
+	reason?: string;
+	args?: Record<string, unknown>;
+}
+
+/** Response to a tool_result_hook_request */
+export interface RpcToolResultHookResponse {
+	type: "tool_result_hook_response";
+	id: string;
+	content?: (TextContent | ImageContent)[];
+	isError?: boolean;
+}
+
+export type RpcToolHookResponse = RpcToolCallHookResponse | RpcToolResultHookResponse;
 
 // ============================================================================
 // Helper type for extracting command types
