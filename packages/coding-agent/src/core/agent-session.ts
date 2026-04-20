@@ -483,6 +483,33 @@ export class AgentSession {
 		this._externalToolHooks = hooks;
 	}
 
+	/**
+	 * Register a custom tool after construction. If a custom tool with the same
+	 * name already exists it is replaced. Custom tools also shadow builtins by
+	 * name through `_refreshToolRegistry`, matching construction-time semantics.
+	 *
+	 * Used by RPC mode to expose client-implemented tools as first-class agent
+	 * tools (system prompt injection, hook participation, agent events).
+	 */
+	addCustomTool(tool: ToolDefinition): void {
+		this._customTools = this._customTools.filter((existing) => existing.name !== tool.name);
+		this._customTools.push(tool);
+		this._refreshToolRegistry();
+	}
+
+	/**
+	 * Remove a custom tool previously registered via `addCustomTool` (or passed
+	 * at construction time). If the tool shadowed a builtin, the builtin is
+	 * restored by the subsequent registry refresh.
+	 */
+	removeCustomTool(name: string): void {
+		const before = this._customTools.length;
+		this._customTools = this._customTools.filter((existing) => existing.name !== name);
+		if (this._customTools.length !== before) {
+			this._refreshToolRegistry();
+		}
+	}
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -2340,9 +2367,14 @@ export class AgentSession {
 				})
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
 		);
-		const wrappedExtensionTools = this._extensionRunner
+		// When an extension runner exists, wrap all custom + registered tools with
+		// extension context. When no runner exists (e.g. a session built without
+		// initial extensions or custom tools, where tools are added post-hoc via
+		// addCustomTool), fall back to wrapping SDK-supplied ToolDefinitions
+		// directly so they still reach the agent's runtime registry.
+		const wrappedExtensionTools: AgentTool[] = this._extensionRunner
 			? wrapRegisteredTools(allCustomTools, this._extensionRunner)
-			: [];
+			: this._customTools.map((definition) => wrapToolDefinition(definition));
 
 		const toolRegistry = new Map(
 			Array.from(this._baseToolDefinitions.values()).map((definition) => [

@@ -12,11 +12,15 @@
  */
 
 import * as crypto from "node:crypto";
+import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
+import { Type } from "@sinclair/typebox";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type {
+	ExtensionContext,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
+	ToolDefinition,
 } from "../../core/extensions/index.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
@@ -31,6 +35,11 @@ import type {
 	RpcSlashCommand,
 	RpcToolCallHookRequest,
 	RpcToolCallHookResponse,
+	RpcToolExecuteCancel,
+	RpcToolExecuteRequest,
+	RpcToolExecuteResponse,
+	RpcToolExecuteUpdate,
+	RpcToolRegistration,
 	RpcToolResultHookRequest,
 	RpcToolResultHookResponse,
 } from "./rpc-types.js";
@@ -44,7 +53,12 @@ export type {
 	RpcSessionState,
 	RpcToolCallHookRequest,
 	RpcToolCallHookResponse,
+	RpcToolExecuteCancel,
+	RpcToolExecuteRequest,
+	RpcToolExecuteResponse,
+	RpcToolExecuteUpdate,
 	RpcToolHookRequest,
+	RpcToolRegistration,
 	RpcToolResultHookRequest,
 	RpcToolResultHookResponse,
 } from "./rpc-types.js";
@@ -96,6 +110,94 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	} | null = null;
 
 	const pendingToolHooks = new Map<string, { resolve: (result: unknown) => void }>();
+
+	// Client-implemented tool state
+	const clientTools = new Map<string, RpcToolRegistration>();
+	const pendingToolExecutions = new Map<
+		string,
+		{
+			resolve: (result: { content: (TextContent | ImageContent)[]; isError: boolean }) => void;
+			reject: (error: Error) => void;
+			onUpdate: (update: { content: (TextContent | ImageContent)[] }) => void;
+		}
+	>();
+
+	/**
+	 * Build a ToolDefinition that forwards execution to the RPC client.
+	 * The agent core validates args against `parameters` before `execute` runs,
+	 * so the client always sees schema-valid input.
+	 */
+	const createRpcBridgeTool = (reg: RpcToolRegistration): ToolDefinition => ({
+		name: reg.name,
+		label: reg.label,
+		description: reg.description,
+		parameters: Type.Unsafe(reg.parameters),
+		promptSnippet: reg.promptSnippet,
+		promptGuidelines: reg.promptGuidelines,
+		executionMode: reg.executionMode,
+		// ExtensionContext is accepted and ignored; client tools don't receive
+		// server-side context. Clients can query server state via existing RPC
+		// commands (e.g. get_state) if needed.
+		execute: (toolCallId, params, signal, onUpdate, _ctx: ExtensionContext) => {
+			const requestId = crypto.randomUUID();
+
+			return new Promise((resolve, reject) => {
+				const cleanup = () => {
+					pendingToolExecutions.delete(requestId);
+					signal?.removeEventListener("abort", onAbort);
+				};
+
+				const onAbort = () => {
+					cleanup();
+					output({ type: "tool_execute_cancel", id: requestId } satisfies RpcToolExecuteCancel);
+					reject(new Error("Tool execution aborted"));
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+
+				pendingToolExecutions.set(requestId, {
+					resolve: (response) => {
+						cleanup();
+						if (response.isError) {
+							const errorText =
+								response.content
+									.filter((c): c is TextContent => c.type === "text")
+									.map((c) => c.text)
+									.join("\n") || "Tool execution failed";
+							reject(new Error(errorText));
+						} else {
+							resolve({ content: response.content, details: undefined });
+						}
+					},
+					reject: (err) => {
+						cleanup();
+						reject(err);
+					},
+					onUpdate: (update) => {
+						onUpdate?.({ content: update.content, details: undefined });
+					},
+				});
+
+				output({
+					type: "tool_execute_request",
+					id: requestId,
+					toolCallId,
+					toolName: reg.name,
+					args: params as Record<string, unknown>,
+				} satisfies RpcToolExecuteRequest);
+			});
+		},
+	});
+
+	/**
+	 * Re-install all client bridge tools on the current session. Called when a
+	 * session is rebound (new/switch/fork) so registered client tools survive
+	 * across session changes for the lifetime of the RPC process.
+	 */
+	const reinstallClientTools = (): void => {
+		for (const reg of clientTools.values()) {
+			session.addCustomTool(createRpcBridgeTool(reg));
+		}
+	};
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -455,6 +557,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		if (toolHookSubscription) {
 			installRpcToolHooks();
 		}
+
+		// Re-install client-registered tools on the new session
+		if (clientTools.size > 0) {
+			reinstallClientTools();
+		}
 	};
 
 	const registerSignalHandlers = (): void => {
@@ -769,6 +876,35 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "unsubscribe_tool_hooks");
 			}
 
+			// =================================================================
+			// Client-Implemented Tools
+			// =================================================================
+
+			case "register_tool": {
+				if (session.isStreaming) {
+					return error(id, "register_tool", "Cannot register tools while agent is streaming");
+				}
+				const reg = command.tool;
+				if (!reg || typeof reg.name !== "string" || !reg.name) {
+					return error(id, "register_tool", "register_tool requires a tool with a non-empty name");
+				}
+				clientTools.set(reg.name, reg);
+				session.addCustomTool(createRpcBridgeTool(reg));
+				return success(id, "register_tool");
+			}
+
+			case "unregister_tool": {
+				if (session.isStreaming) {
+					return error(id, "unregister_tool", "Cannot unregister tools while agent is streaming");
+				}
+				if (!clientTools.has(command.toolName)) {
+					return error(id, "unregister_tool", `No client tool registered: ${command.toolName}`);
+				}
+				clientTools.delete(command.toolName);
+				session.removeCustomTool(command.toolName);
+				return success(id, "unregister_tool");
+			}
+
 			default: {
 				const unknownCommand = command as { type: string };
 				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
@@ -848,6 +984,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
+		// Handle client tool execution streaming updates
+		if (typeof parsed === "object" && parsed !== null && "type" in parsed && parsed.type === "tool_execute_update") {
+			const update = parsed as RpcToolExecuteUpdate;
+			const pending = pendingToolExecutions.get(update.id);
+			if (pending) {
+				pending.onUpdate({ content: update.content });
+			}
+			return;
+		}
+
+		// Handle client tool execution final responses
+		if (typeof parsed === "object" && parsed !== null && "type" in parsed && parsed.type === "tool_execute_response") {
+			const response = parsed as RpcToolExecuteResponse;
+			const pending = pendingToolExecutions.get(response.id);
+			if (pending) {
+				pending.resolve({ content: response.content, isError: response.isError ?? false });
+			}
+			return;
+		}
+
 		const command = parsed as RpcCommand;
 		try {
 			const response = await handleCommand(command);
@@ -867,6 +1023,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	};
 
 	const onInputEnd = () => {
+		// Reject any in-flight client tool executions so the agent loop doesn't
+		// hang waiting for responses that will never arrive after the client
+		// disconnected. Pending tool-hook resolutions are left to resolve with
+		// `undefined` via the agent signal abort that fires during shutdown.
+		for (const [, pending] of pendingToolExecutions) {
+			pending.reject(new Error("RPC client disconnected before tool execution completed"));
+		}
+		pendingToolExecutions.clear();
 		void shutdown();
 	};
 	process.stdin.on("end", onInputEnd);

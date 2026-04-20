@@ -17,8 +17,13 @@ import type {
 	RpcSessionState,
 	RpcSlashCommand,
 	RpcToolCallHookRequest,
+	RpcToolExecuteCancel,
+	RpcToolExecuteRequest,
+	RpcToolRegistration,
 	RpcToolResultHookRequest,
 } from "./rpc-types.js";
+
+export type { RpcToolRegistration } from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -70,6 +75,28 @@ export type ToolResultHookHandler = (request: {
 	isError: boolean;
 }) => Promise<{ content?: (TextContent | ImageContent)[]; isError?: boolean } | undefined>;
 
+/** Request passed to a client tool execute handler. */
+export interface ToolExecuteRequest {
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+	/** Aborts when the server sends `tool_execute_cancel` (agent abort, etc.). */
+	signal: AbortSignal;
+}
+
+/** Final result returned from a client tool execute handler. */
+export interface ToolExecuteResult {
+	content: (TextContent | ImageContent)[];
+	isError?: boolean;
+}
+
+/**
+ * Handler for `tool_execute_request` events. The client dispatches to the
+ * appropriate implementation by `toolName`. If the handler throws, the
+ * server receives an error result and the agent treats the call as failed.
+ */
+export type ToolExecuteHandler = (request: ToolExecuteRequest) => Promise<ToolExecuteResult>;
+
 // ============================================================================
 // RPC Client
 // ============================================================================
@@ -84,6 +111,8 @@ export class RpcClient {
 	private stderr = "";
 	private toolCallHookHandler: ToolCallHookHandler | null = null;
 	private toolResultHookHandler: ToolResultHookHandler | null = null;
+	private toolExecuteHandler: ToolExecuteHandler | null = null;
+	private pendingToolExecutions = new Map<string, AbortController>();
 
 	constructor(private options: RpcClientOptions = {}) {}
 
@@ -476,6 +505,46 @@ export class RpcClient {
 	}
 
 	// =========================================================================
+	// Client-Implemented Tools
+	// =========================================================================
+
+	/**
+	 * Register a client-implemented tool. The agent becomes able to call it by
+	 * `name`; each invocation is routed back to the `onToolExecute` handler.
+	 * Registering a tool with the same name replaces the previous registration.
+	 * Shadowing a builtin (e.g. `"bash"`) is allowed.
+	 *
+	 * Cannot be called while the agent is streaming.
+	 */
+	async registerTool(tool: RpcToolRegistration): Promise<void> {
+		await this.send({ type: "register_tool", tool });
+	}
+
+	/**
+	 * Unregister a client-implemented tool. If the tool shadowed a builtin, the
+	 * builtin is restored. Cannot be called while the agent is streaming.
+	 */
+	async unregisterTool(toolName: string): Promise<void> {
+		await this.send({ type: "unregister_tool", toolName });
+	}
+
+	/**
+	 * Install the handler for `tool_execute_request` events. Only one handler
+	 * may be installed at a time; the handler dispatches by `request.toolName`.
+	 *
+	 * Returns an unsubscribe function that detaches the handler. In-flight
+	 * executions are allowed to finish.
+	 */
+	onToolExecute(handler: ToolExecuteHandler): () => void {
+		this.toolExecuteHandler = handler;
+		return () => {
+			if (this.toolExecuteHandler === handler) {
+				this.toolExecuteHandler = null;
+			}
+		};
+	}
+
+	// =========================================================================
 	// Helpers
 	// =========================================================================
 
@@ -557,6 +626,16 @@ export class RpcClient {
 				return;
 			}
 
+			// Handle client tool execution requests / cancellations
+			if (data.type === "tool_execute_request") {
+				this.handleToolExecuteRequest(data as RpcToolExecuteRequest);
+				return;
+			}
+			if (data.type === "tool_execute_cancel") {
+				this.handleToolExecuteCancel(data as RpcToolExecuteCancel);
+				return;
+			}
+
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
 				listener(data as AgentEvent);
@@ -592,6 +671,62 @@ export class RpcClient {
 				// On handler error, respond with no-op to avoid blocking
 				this.process?.stdin?.write(serializeJsonLine({ type: "tool_call_hook_response", id: request.id }));
 			});
+	}
+
+	private handleToolExecuteRequest(request: RpcToolExecuteRequest): void {
+		const handler = this.toolExecuteHandler;
+		if (!handler) {
+			this.process?.stdin?.write(
+				serializeJsonLine({
+					type: "tool_execute_response",
+					id: request.id,
+					content: [{ type: "text", text: `No client handler registered for tool '${request.toolName}'` }],
+					isError: true,
+				}),
+			);
+			return;
+		}
+
+		const controller = new AbortController();
+		this.pendingToolExecutions.set(request.id, controller);
+
+		handler({
+			toolCallId: request.toolCallId,
+			toolName: request.toolName,
+			args: request.args,
+			signal: controller.signal,
+		})
+			.then((result) => {
+				this.pendingToolExecutions.delete(request.id);
+				this.process?.stdin?.write(
+					serializeJsonLine({
+						type: "tool_execute_response",
+						id: request.id,
+						content: result.content,
+						isError: result.isError,
+					}),
+				);
+			})
+			.catch((err: unknown) => {
+				this.pendingToolExecutions.delete(request.id);
+				const message = err instanceof Error ? err.message : String(err);
+				this.process?.stdin?.write(
+					serializeJsonLine({
+						type: "tool_execute_response",
+						id: request.id,
+						content: [{ type: "text", text: message }],
+						isError: true,
+					}),
+				);
+			});
+	}
+
+	private handleToolExecuteCancel(cancel: RpcToolExecuteCancel): void {
+		const controller = this.pendingToolExecutions.get(cancel.id);
+		if (controller) {
+			this.pendingToolExecutions.delete(cancel.id);
+			controller.abort();
+		}
 	}
 
 	private handleToolResultHookRequest(request: RpcToolResultHookRequest): void {

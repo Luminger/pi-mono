@@ -5,6 +5,7 @@
 ### Added
 
 - RPC tool hooks: `subscribe_tool_hooks` and `unsubscribe_tool_hooks` commands expose `tool_call` (pre-execution) and `tool_result` (post-execution) hooks over the RPC protocol. RPC clients can now block tool calls, rewrite arguments, and modify results with the same capabilities as server-side extensions.
+- RPC client-implemented tools: `register_tool` / `unregister_tool` commands let RPC clients register tools whose execution logic lives in the client process. The server forwards each invocation via `tool_execute_request` / `tool_execute_response` (plus optional `tool_execute_update` streaming updates and `tool_execute_cancel` on agent abort). Client tools participate in system-prompt injection, extension + RPC tool hooks, and agent events like any builtin, and can shadow builtins by name. Exposes new `AgentSession.addCustomTool` / `removeCustomTool` methods for post-construction tool mutation.
 
 ## [0.67.68] - 2026-04-17
 

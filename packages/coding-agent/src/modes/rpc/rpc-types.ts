@@ -5,7 +5,7 @@
  * Responses and events are emitted as JSON lines on stdout.
  */
 
-import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, ThinkingLevel, ToolExecutionMode } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -74,7 +74,32 @@ export type RpcCommand =
 			hooks: { tool_call?: boolean; tool_result?: boolean };
 			toolNames?: string[];
 	  }
-	| { id?: string; type: "unsubscribe_tool_hooks" };
+	| { id?: string; type: "unsubscribe_tool_hooks" }
+
+	// Client-implemented tools
+	| { id?: string; type: "register_tool"; tool: RpcToolRegistration }
+	| { id?: string; type: "unregister_tool"; toolName: string };
+
+// ============================================================================
+// Client-Implemented Tools
+// ============================================================================
+
+/**
+ * Description of a tool whose execution logic lives in the RPC client process.
+ * The server creates a bridge tool that forwards execution requests over the
+ * protocol. Parameters are JSON Schema, wrapped into TypeBox via `Type.Unsafe`
+ * on the server for validation.
+ */
+export interface RpcToolRegistration {
+	name: string;
+	label: string;
+	description: string;
+	/** JSON Schema for the tool's parameter object. */
+	parameters: Record<string, unknown>;
+	promptSnippet?: string;
+	promptGuidelines?: string[];
+	executionMode?: ToolExecutionMode;
+}
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)
@@ -213,6 +238,10 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "subscribe_tool_hooks"; success: true }
 	| { id?: string; type: "response"; command: "unsubscribe_tool_hooks"; success: true }
 
+	// Client-implemented tools
+	| { id?: string; type: "response"; command: "register_tool"; success: true }
+	| { id?: string; type: "response"; command: "unregister_tool"; success: true }
+
 	// Error response (any command can fail)
 	| { id?: string; type: "response"; command: string; success: false; error: string };
 
@@ -316,6 +345,44 @@ export interface RpcToolResultHookResponse {
 }
 
 export type RpcToolHookResponse = RpcToolCallHookResponse | RpcToolResultHookResponse;
+
+// ============================================================================
+// Client Tool Execution Events (stdout)
+// ============================================================================
+
+/** Server asks the client to execute a registered tool. */
+export interface RpcToolExecuteRequest {
+	type: "tool_execute_request";
+	id: string;
+	toolCallId: string;
+	toolName: string;
+	args: Record<string, unknown>;
+}
+
+/** Server tells the client a pending execution was cancelled (agent aborted). */
+export interface RpcToolExecuteCancel {
+	type: "tool_execute_cancel";
+	id: string;
+}
+
+// ============================================================================
+// Client Tool Execution Responses (stdin)
+// ============================================================================
+
+/** Optional streaming partial update from the client during tool execution. */
+export interface RpcToolExecuteUpdate {
+	type: "tool_execute_update";
+	id: string;
+	content: (TextContent | ImageContent)[];
+}
+
+/** Final result from client tool execution. */
+export interface RpcToolExecuteResponse {
+	type: "tool_execute_response";
+	id: string;
+	content: (TextContent | ImageContent)[];
+	isError?: boolean;
+}
 
 // ============================================================================
 // Helper type for extracting command types
